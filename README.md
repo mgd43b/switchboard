@@ -145,6 +145,7 @@ who's connected and what's queued, without an MCP client:
 switchboard participants     # live participants (name, role, idle time)
 switchboard tail             # queued (undelivered) messages
 switchboard tail --follow    # …and keep watching
+switchboard prune            # delete old dead-letter messages + expired participants
 ```
 
 Example recipes for the lead loop and workers live in [`examples/`](examples/).

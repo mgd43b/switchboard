@@ -520,6 +520,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     tail.add_argument(
         "--interval", type=float, default=1.0, help="Follow poll interval in seconds (default 1)."
     )
+    prune = sub.add_parser(
+        "prune", help="Delete old undelivered messages and expired participants (housekeeping)."
+    )
+    prune.add_argument(
+        "--older-than-days",
+        type=float,
+        default=7.0,
+        help="Delete queued messages older than this many days (default 7).",
+    )
     return parser
 
 
@@ -575,6 +584,18 @@ def _cli_tail(db_path, *, follow: bool = False, interval: float = 1.0) -> int:
     return 0
 
 
+def _cli_prune(db_path, ttl: float, older_than_days: float) -> int:
+    store = _open_store_ro(db_path)
+    if store is None:
+        print("Nothing to prune (no database).")
+        return 0
+    now = _now()
+    msgs = store.prune_messages(older_than=now - older_than_days * 86400.0)
+    parts = store.prune_participants(now=now, ttl=ttl)
+    print(f"Pruned {msgs} old message(s) and {parts} expired participant(s).")
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
@@ -594,6 +615,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _cli_participants(db_path, ttl)
     if args.cmd == "tail":
         return _cli_tail(db_path, follow=args.follow, interval=args.interval)
+    if args.cmd == "prune":
+        return _cli_prune(db_path, ttl, args.older_than_days)
 
     store = Store(db_path)
     mcp = build_server(store, ttl=ttl)

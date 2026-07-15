@@ -274,6 +274,14 @@ def test_pending_messages_respects_limit(store):
     assert len(store.pending_messages(limit=3)) == 3
 
 
+def test_prune_messages_removes_old_keeps_new(store):
+    store.send("a", "old", sender="x", now=100.0)
+    store.send("a", "new", sender="x", now=200.0)
+    removed = store.prune_messages(older_than=150.0)
+    assert removed == 1
+    assert [m.body for m in store.inbox("a", peek=True)] == ["new"]
+
+
 def test_pending_messages_since_pages_through_backlog(store):
     ids = [store.send("a", f"m{i}", sender="x", now=float(i)) for i in range(5)]
     # Everything after the 2nd id.

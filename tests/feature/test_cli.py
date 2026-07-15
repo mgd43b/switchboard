@@ -142,6 +142,28 @@ def test_main_tail_pages_past_the_limit(monkeypatch, tmp_path, capsys):
     assert out.count("-> lead:") == 150
 
 
+def test_main_prune_removes_old_messages_and_stale_participants(monkeypatch, tmp_path, capsys):
+    db = tmp_path / "prune.db"
+    s = Store(db)
+    now = time.time()
+    old = now - 8 * 86400  # 8 days ago (past the 7-day default and the 300s TTL)
+    s.send("lead", "ancient", sender="w", now=old)
+    s.send("lead", "fresh", sender="w", now=now)
+    s.register("stale", now=old)
+    monkeypatch.setenv("SWITCHBOARD_DB", str(db))
+
+    assert main(["prune"]) == 0
+    out = capsys.readouterr().out
+    assert "Pruned 1 old message(s) and 1 expired participant(s)." in out
+    assert [m.body for m in Store(db).inbox("lead", peek=True)] == ["fresh"]
+
+
+def test_main_prune_no_database(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("SWITCHBOARD_DB", str(tmp_path / "nope.db"))
+    assert main(["prune"]) == 0
+    assert "Nothing to prune" in capsys.readouterr().out
+
+
 def test_inspection_commands_do_not_create_missing_db(monkeypatch, tmp_path, capsys):
     missing = tmp_path / "never" / "switchboard.db"
     monkeypatch.setenv("SWITCHBOARD_DB", str(missing))

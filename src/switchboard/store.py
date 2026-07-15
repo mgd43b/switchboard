@@ -388,6 +388,19 @@ class Store:
             ).fetchall()
         return [_row_to_message(r) for r in rows]
 
+    def prune_messages(self, *, older_than: float) -> int:
+        """Delete messages created before ``older_than`` (epoch seconds).
+
+        Returns the number removed. Delivery only removes a row when a recipient
+        drains it, so a message sent to an address that is never read would sit
+        forever; this is the housekeeping escape hatch (exposed via the
+        ``switchboard prune`` CLI). It never touches messages newer than the
+        cutoff, so it will not race ahead of a recipient that is about to read.
+        """
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM messages WHERE created_at < ?", (float(older_than),))
+            return cur.rowcount if cur.rowcount is not None else 0
+
     def has_messages(self, name: str, role: str = "", *, since: Optional[int] = None) -> bool:
         """Cheap existence check used by the server's wait() poll loop."""
         addresses = _addresses(name, role)

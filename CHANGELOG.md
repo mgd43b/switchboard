@@ -18,7 +18,8 @@ First release. Everything below ships in `0.1.0` when the first `v0.1.0` tag is 
   name‑ and role‑based addressing.
 - stdio transport (default, one process per session, shared via SQLite) and an experimental
   streamable‑HTTP daemon (`switchboard serve`) with opt‑in Channels push (`SWITCHBOARD_PUSH`).
-- Human‑facing inspection CLI: `switchboard participants` and `switchboard tail [--follow]`.
+- Human‑facing inspection CLI: `switchboard participants`, `switchboard tail [--follow]`, and
+  `switchboard prune` (delete old dead‑letter messages and expired participants).
 - Environment configuration: `SWITCHBOARD_DB`, `SWITCHBOARD_TTL`, `SWITCHBOARD_NAME`,
   `SWITCHBOARD_ROLE`, `SWITCHBOARD_PUSH`, `SWITCHBOARD_HOST`, `SWITCHBOARD_PORT`.
 - Tooling: ruff lint + format, pytest with an enforced coverage gate (100% today), CI on
