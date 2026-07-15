@@ -4,16 +4,9 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0](https://github.com/mgd43b/switchboard-relay/compare/v0.1.0...v0.1.0) (2026-07-15)
+## [0.1.0](https://github.com/mgd43b/switchboard-relay/releases/tag/v0.1.0) (2026-07-15)
 
-
-### Miscellaneous Chores
-
-* release 0.1.0 ([8d3cedb](https://github.com/mgd43b/switchboard-relay/commit/8d3cedb470d17abe0008367dc89f671eb729a681))
-
-## [0.1.0]
-
-Initial release. (Future versions are appended above this by release-please.)
+Initial release.
 
 ### Added
 
@@ -32,4 +25,3 @@ Initial release. (Future versions are appended above this by release-please.)
 - Tooling: ruff lint + format, pytest with an enforced coverage gate (100% today), CI on
   Python 3.10–3.14, PyPI trusted‑publishing release workflow, and a Homebrew tap formula.
 
-[0.1.0]: https://github.com/mgd43b/switchboard-relay/releases/tag/v0.1.0
