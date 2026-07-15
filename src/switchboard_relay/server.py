@@ -106,8 +106,9 @@ def _resolve_max_body() -> int:
     if raw is None or raw.strip() == "":
         return DEFAULT_MAX_BODY_BYTES
     try:
+        # OverflowError guards against e.g. "1e309" -> float('inf') -> int(inf).
         val = int(float(raw))
-    except ValueError:
+    except (ValueError, OverflowError):
         return DEFAULT_MAX_BODY_BYTES
     return val if val > 0 else 0  # 0 / negative -> cap disabled
 
@@ -564,8 +565,10 @@ def build_server(
         store,
         ttl=ttl if ttl is not None else _resolve_ttl(),
         board=board,
-        msg_ttl=msg_ttl if msg_ttl is not None else DEFAULT_MSG_TTL_SECONDS,
-        max_body=max_body if max_body is not None else DEFAULT_MAX_BODY_BYTES,
+        # Match the ttl pattern: resolve from the environment when not supplied,
+        # so programmatic callers behave like the CLI.
+        msg_ttl=msg_ttl if msg_ttl is not None else _resolve_msg_ttl(),
+        max_body=max_body if max_body is not None else _resolve_max_body(),
     )
 
     mcp = FastMCP(
@@ -752,15 +755,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _open_store_ro(db_path) -> Optional[Store]:
-    """Open the store for a read-only peek, or None if it does not exist yet.
+    """Open an existing store for inspection, or None if it does not exist yet.
 
-    Avoids materializing the database file (and its WAL sidecars) just to run an
-    inspection command against a system that has never started the server.
+    Returns None (creating nothing) when the database file is absent, so an
+    inspection command never materializes a db on a system that has not started
+    the server. When it does exist, it is opened with ``init_schema=False`` -- no
+    WAL-mode switch, no CREATE TABLE -- so a read-only command (doctor,
+    participants, tail) writes no schema state. (`prune` also uses this and then
+    issues its DELETEs; the tables already exist.)
     """
     p = Path(str(db_path)).expanduser()
     if str(p) != ":memory:" and not p.exists():
         return None
-    return Store(db_path)
+    return Store(db_path, init_schema=False)
 
 
 def _discover_boards() -> list[tuple[str, Path]]:
@@ -860,11 +867,11 @@ def _cli_doctor(target, ttl: float) -> int:
 
     hints = []
     if len(parts) <= 1:
-        n = len(parts)
+        who = "no live participants" if not parts else "only 1 live participant"
         hints.append(
-            f"only {n} live participant on this board -- if a peer should be here, it is likely "
-            "on a DIFFERENT board. Compare with `switchboard-relay boards`, or put both sessions "
-            "on the same $SWITCHBOARD_BOARD."
+            f"{who} on this board -- if a peer should be here, it is likely on a DIFFERENT board. "
+            "Compare with `switchboard-relay boards`, or put both sessions on the same "
+            "$SWITCHBOARD_BOARD."
         )
     if dead_queued:
         hints.append(

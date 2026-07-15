@@ -60,32 +60,40 @@ def test_n_process_exactly_once_shared_role(tmp_path):
     db = str(tmp_path / "stress.db")
     Store(db).close()  # create schema + WAL up front so workers don't race first-init
 
-    mgr = ctx.Manager()
-    sent_ids = mgr.list()
-    recv_ids = mgr.list()
-    done = ctx.Event()
-    deadline = time.time() + _SAFETY_TIMEOUT_S
+    with ctx.Manager() as mgr:
+        sent_ids = mgr.list()
+        recv_ids = mgr.list()
+        done = ctx.Event()
+        deadline = time.time() + _SAFETY_TIMEOUT_S
 
-    drainers = [
-        ctx.Process(target=_drainer, args=(db, f"d{k}", done, recv_ids, deadline))
-        for k in range(DRAINERS)
-    ]
-    for d in drainers:
-        d.start()
-    senders = [
-        ctx.Process(target=_sender, args=(db, i, PER_SENDER, sent_ids)) for i in range(SENDERS)
-    ]
-    for s in senders:
-        s.start()
+        drainers = [
+            ctx.Process(target=_drainer, args=(db, f"d{k}", done, recv_ids, deadline))
+            for k in range(DRAINERS)
+        ]
+        for d in drainers:
+            d.start()
+        senders = [
+            ctx.Process(target=_sender, args=(db, i, PER_SENDER, sent_ids)) for i in range(SENDERS)
+        ]
+        for s in senders:
+            s.start()
 
-    for s in senders:
-        s.join(_SAFETY_TIMEOUT_S)
-    done.set()  # tell drainers the producers are finished
-    for d in drainers:
-        d.join(_SAFETY_TIMEOUT_S)
+        for s in senders:
+            s.join(_SAFETY_TIMEOUT_S)
+        done.set()  # tell drainers the producers are finished
+        for d in drainers:
+            d.join(_SAFETY_TIMEOUT_S)
 
-    sent = list(sent_ids)
-    received = list(recv_ids)
+        # No worker should still be running; kill any straggler and fail loudly so
+        # a hang surfaces here instead of leaking a process past the test.
+        stragglers = [p for p in (*senders, *drainers) if p.is_alive()]
+        for p in stragglers:
+            p.terminate()
+            p.join(1)
+        assert not stragglers, f"{len(stragglers)} worker process(es) did not exit in time"
+
+        sent = list(sent_ids)
+        received = list(recv_ids)
 
     assert len(sent) == TOTAL, "every send must return an id"
     assert len(received) == len(set(received)), "no message delivered more than once"

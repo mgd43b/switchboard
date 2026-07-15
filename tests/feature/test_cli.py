@@ -161,6 +161,18 @@ def test_main_doctor_healthy_when_peers_and_no_dead_mail(monkeypatch, tmp_path, 
     assert "looks healthy" in out
 
 
+def test_main_doctor_zero_participants_hint(monkeypatch, tmp_path, capsys):
+    # An existing board with nobody live must read grammatically ("no live
+    # participants", not "only 0 live participant").
+    db = tmp_path / "z.db"
+    Store(db).send("x", "queued for nobody", sender="ghost", now=time.time())
+    monkeypatch.setenv("SWITCHBOARD_DB", str(db))
+    assert main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "live participants: 0" in out
+    assert "no live participants on this board" in out
+
+
 def test_main_doctor_no_db_does_not_create_it(monkeypatch, tmp_path, capsys):
     missing = tmp_path / "nope.db"
     monkeypatch.setenv("SWITCHBOARD_DB", str(missing))
@@ -211,6 +223,12 @@ def test_resolve_max_body_reads_positive(monkeypatch):
 
 def test_resolve_max_body_falls_back_on_bad_value(monkeypatch):
     monkeypatch.setenv("SWITCHBOARD_MAX_BODY", "huge")
+    assert server._resolve_max_body() == server.DEFAULT_MAX_BODY_BYTES
+
+
+def test_resolve_max_body_handles_overflow(monkeypatch):
+    # "1e309" -> float('inf') -> int(inf) raises OverflowError; must not crash.
+    monkeypatch.setenv("SWITCHBOARD_MAX_BODY", "1e309")
     assert server._resolve_max_body() == server.DEFAULT_MAX_BODY_BYTES
 
 
