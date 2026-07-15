@@ -56,7 +56,7 @@ tools are available. Verify with `claude mcp list`.
 
 > **No install step?** If you'd rather not install anything, point Claude Code at `uvx`:
 > ```bash
-> claude mcp add --scope user -- uvx switchboard-relay
+> claude mcp add --scope user -- uvx --from switchboard-relay switchboard
 > ```
 
 ### Make the tools run without a confirmation prompt (allowlist)
