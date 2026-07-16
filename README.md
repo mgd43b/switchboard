@@ -442,18 +442,6 @@ falls back to the durable poll — nothing breaks, the message just waits in the
    A session that connected normally still works; it just polls instead of reacting.
 
 Note that "daemon" is **not** a constraint: turn injection works over the plain stdio install (below).
-
-Turn injection works **only** when all three hold. Miss any one and delivery silently falls back to
-the durable poll — nothing breaks, the message just waits in the inbox as usual:
-
-1. **Push is enabled.** It's a background convenience with a small polling cost, so it's **off by
-   default on stdio** — set `SWITCHBOARD_PUSH=1` to turn it on. (The daemon defaults it **on**.)
-2. **The recipient session is open.** Channels inject into a *running* session on its next turn.
-   Nothing can wake a fully idle or closed session — see [How it works](#how-it-works).
-3. **The recipient subscribed to switchboard as a channel** — launched with the channel flag below.
-   A session that connected normally still works; it just polls instead of reacting.
-
-Note that "daemon" is **not** a constraint: turn injection works over the plain stdio install (below).
 The daemon is an optional alternative for the multi‑client‑on‑one‑process case.
 
 ### Setup (recommended: stdio, no daemon)

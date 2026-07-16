@@ -495,8 +495,11 @@ class Switchboard:
                 continue
             self._watch_hw[sid] = max(m.id for m in new)
             latest = new[-1]
+            # Use the message's stored recipient (its name OR role) so msg_to is
+            # accurate and consistent with the daemon push path -- conn.name would
+            # lose the role on a role-addressed message.
             if await self._nudge(
-                conn, sender=latest.sender, to=conn.name, mid=latest.id, reply_to=latest.reply_to
+                conn, sender=latest.sender, to=latest.to, mid=latest.id, reply_to=latest.reply_to
             ):
                 nudged += 1
         return nudged

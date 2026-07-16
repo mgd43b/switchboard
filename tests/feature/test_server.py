@@ -638,6 +638,18 @@ def test_watch_tick_nudges_local_session_and_leaves_message(board):
     assert board.store.has_messages("lead")
 
 
+def test_watch_tick_role_message_reports_role_as_msg_to(board):
+    # A role-addressed message must nudge with msg_to = the role (the message's
+    # stored recipient), not the reader's name -- consistent with daemon push.
+    board._push_enabled = True
+    ctx = _ctx()
+    board.register(ctx, "worker:7", "worker")
+    board.store.send("worker", "any worker?", sender="lead", now=time.time())  # to the role
+    assert _tick(board) == 1
+    dumped = ctx.session.sent[0].model_dump(by_alias=True, mode="json", exclude_none=True)
+    assert dumped["params"]["meta"]["msg_to"] == "worker"
+
+
 def test_watch_tick_does_not_renudge_same_message(board):
     board._push_enabled = True
     ctx = _ctx()
