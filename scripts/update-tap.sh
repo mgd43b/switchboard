@@ -97,6 +97,7 @@ if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 
 command -v brew >/dev/null 2>&1 || { error "Homebrew is required (macOS)."; exit 1; }
+command -v python3 >/dev/null 2>&1 || { error "python3 is required (to parse PyPI's JSON)."; exit 1; }
 
 info "Updating Homebrew tap for ${FORMULA_NAME} v${VERSION}"
 [[ "$DRY_RUN" == true ]] && warn "DRY RUN — no commit or push"
@@ -105,9 +106,16 @@ info "Updating Homebrew tap for ${FORMULA_NAME} v${VERSION}"
 # FormulaAudit/PyPiUrls requires the canonical hash-path "Source" URL (the
 # predictable /packages/source/ shorthand is rejected by `brew style`), and the
 # hash path can't be constructed from the version -- so ask PyPI's JSON API.
+# Each failure mode gets its own message: fetch, parse, and no-sdist are
+# different problems (unpublished version vs network vs API change).
 PYPI_JSON_URL="https://pypi.org/pypi/${PYPI_NAME}/${VERSION}/json"
 info "Resolving sdist via PyPI: ${PYPI_JSON_URL}"
-SDIST_META="$(curl -sfL "$PYPI_JSON_URL" | python3 -c '
+if ! PYPI_JSON="$(curl -sfL "$PYPI_JSON_URL")"; then
+    error "Could not fetch ${PYPI_JSON_URL} — either ${PYPI_NAME} ${VERSION} is not"
+    error "on PyPI yet (publish it first: tag v${VERSION}) or the request failed."
+    exit 1
+fi
+if ! SDIST_META="$(python3 -c '
 import json, sys
 data = json.load(sys.stdin)
 for u in data["urls"]:
@@ -115,11 +123,15 @@ for u in data["urls"]:
         print(u["url"])
         print(u["digests"]["sha256"])
         break
-' 2>/dev/null || true)"
+' <<<"$PYPI_JSON")"; then
+    error "Could not parse the PyPI JSON response (unexpected format/API change?)."
+    exit 1
+fi
 SDIST_URL="$(sed -n 1p <<<"$SDIST_META")"
 SHA256="$(sed -n 2p <<<"$SDIST_META")"
 if [[ -z "$SDIST_URL" || -z "$SHA256" ]]; then
-    error "sdist not found on PyPI. Publish ${PYPI_NAME} ${VERSION} first (tag v${VERSION})."
+    error "The ${VERSION} release on PyPI has no sdist (wheels only?). A source"
+    error "tarball is required for the formula."
     exit 1
 fi
 success "sdist: ${SDIST_URL}"
@@ -161,7 +173,7 @@ awk -v new="$SDIST_URL" '
     { print }
 ' "$FORMULA_PATH" > "${FORMULA_PATH}.tmp" && mv "${FORMULA_PATH}.tmp" "$FORMULA_PATH"
 awk -v new="$SHA256" '
-    !done && /sha256 "/ { sub(/sha256 "[^"]*"/, "sha256 \"" new "\""); done=1 }
+    !done && /^  sha256 "/ { sub(/sha256 "[^"]*"/, "sha256 \"" new "\""); done=1 }
     { print }
 ' "$FORMULA_PATH" > "${FORMULA_PATH}.tmp" && mv "${FORMULA_PATH}.tmp" "$FORMULA_PATH"
 success "Bumped url + sha256"
