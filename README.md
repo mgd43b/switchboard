@@ -188,9 +188,9 @@ Then restart Claude Desktop. Notes:
   swap in `"command": "uvx", "args": ["switchboard-relay"]` to skip installing.
 - Claude Desktop isn't project‑scoped, so pin an explicit `SWITCHBOARD_BOARD` (see
   [Boards](#boards-one-switchboard-per-project)) to keep its sessions on a predictable board.
-- Claude Desktop gets the durable tools (`register`/`send`/`inbox`/`wait`) but **not**
-  [turn injection](#turn-injection-push) — that's a Claude Code launch‑flag feature, so a Desktop
-  session polls rather than auto‑reacting.
+- Claude Desktop can't self‑react via Channels (no launch flag), but it *can* be a turn‑injection
+  reactor via [`ccd_session_mgmt`](#reacting-on-claude-desktop-ccd_session_mgmt) with one approval
+  click per message (`SWITCHBOARD_CCD_INJECT=1`). Otherwise it uses the durable tools and polls.
 
 ### Run the tools without a confirmation prompt (optional)
 
@@ -384,7 +384,9 @@ All optional. Set as environment variables (e.g. via `claude mcp add --env KEY=v
 | `SWITCHBOARD_MAX_BODY` | `262144` (256 KiB) | Reject a `send()` whose body exceeds this many UTF‑8 bytes. Set `0` to disable the cap. |
 | `SWITCHBOARD_NAME` | — | Auto‑register this session under this address (skips an explicit `register`; also the fallback when `register()` is called without a name). |
 | `SWITCHBOARD_ROLE` | — | Role to pair with `SWITCHBOARD_NAME`. |
-| `SWITCHBOARD_PUSH` | *(stdio: off, daemon: on)* | Enable [turn‑injection push](#turn-injection-push). On **stdio** it's off by default (a background poll cost) — set `1` to run the self‑watch loop. In the **daemon** it defaults **on** (set `0` to disable). |
+| `SWITCHBOARD_PUSH` | *(stdio: off, daemon: on)* | Enable [turn‑injection push](#turn-injection-push) over Channels (CLI reactors). On **stdio** it's off by default (a background poll cost) — set `1` to run the self‑watch loop. In the **daemon** it defaults **on** (set `0` to disable). |
+| `SWITCHBOARD_CCD_INJECT` | `0` | Enable [turn injection on Claude Desktop](#reacting-on-claude-desktop-ccd_session_mgmt): `send()` returns an `inject` hint so the sender's Claude can call `ccd_session_mgmt.send_message`. Off by default (leans on a Desktop tool + a per‑message approval). |
+| `SWITCHBOARD_CCD_SESSION_ID` | *(`local_<CLAUDE_CODE_SESSION_ID>`)* | Override this session's CCD id used for Desktop injection. Needed only when the default derivation is wrong (e.g. an agent/child session). Used verbatim. |
 
 Example — a longer liveness window:
 
@@ -414,17 +416,32 @@ property of how Claude Code sessions work, not a switchboard limitation.
 By default a recipient only learns about a message when *it* next polls (`inbox()`/`wait()`).
 **Turn injection** removes that wait: a `send()` makes the recipient's open session **react on the
 spot** — the message arrives *as a turn*, and the session drains its inbox and acts, with no manual
-poll. It rides Claude Code's [Channels](https://code.claude.com/docs/en/channels) capability (a
-research preview) — the "responsive‑lead" setup, a lead that answers the instant a worker asks.
+poll. It's the "responsive‑lead" setup — a lead that answers the instant a worker asks.
 
-> **Claude Code (CLI) only.** You subscribe a session to a channel with a `claude` **launch flag**
-> (`--dangerously-load-development-channels`, below). **Claude Desktop and the IDE extensions have no
-> such flag, so they can't receive injected turns** — Channels is a Claude Code feature. They still
-> use switchboard's durable tools (`register`/`send`/`inbox`/`wait`) and just **poll**: a Desktop
-> session and a Claude Code session on the same board exchange messages fine, only the Desktop side
-> won't auto‑react. So the *reactor* must be Claude Code; the *sender* can be anything.
+There are **two mechanisms**, by recipient surface — set up whichever matches where your *reactor*
+runs (the *sender* can be any surface):
 
-### The three hard constraints (be honest about these)
+| Reactor runs on… | Mechanism | Feel |
+|---|---|---|
+| **Claude Code (CLI/terminal)** | [Channels](https://code.claude.com/docs/en/channels) — the recipient self‑injects | **zero‑touch**, fully automatic |
+| **Claude Desktop** | `ccd_session_mgmt.send_message` — the *sender* injects | **one approval click per message** |
+
+Both are best‑effort accelerators on top of durable poll, and both preserve **drain‑once**. Below:
+the CLI setup first, then the Desktop setup.
+
+### Reacting on the CLI (Channels) — the three hard constraints
+
+Turn injection over Channels works **only** when all three hold. Miss any one and delivery silently
+falls back to the durable poll — nothing breaks, the message just waits in the inbox as usual:
+
+1. **Push is enabled.** It's a background convenience with a small polling cost, so it's **off by
+   default on stdio** — set `SWITCHBOARD_PUSH=1` to turn it on. (The daemon defaults it **on**.)
+2. **The recipient session is open.** Channels inject into a *running* session on its next turn.
+   Nothing can wake a fully idle or closed session — see [How it works](#how-it-works).
+3. **The recipient subscribed to switchboard as a channel** — launched with the channel flag below.
+   A session that connected normally still works; it just polls instead of reacting.
+
+Note that "daemon" is **not** a constraint: turn injection works over the plain stdio install (below).
 
 Turn injection works **only** when all three hold. Miss any one and delivery silently falls back to
 the durable poll — nothing breaks, the message just waits in the inbox as usual:
@@ -482,6 +499,43 @@ switchboard-relay serve --host 127.0.0.1 --port 8765
 claude mcp add --scope user --transport http switchboard-relay http://127.0.0.1:8765/mcp
 # ...then launch each reacting session with the same --dangerously-load-development-channels flag.
 ```
+
+### Reacting on Claude Desktop (`ccd_session_mgmt`)
+
+Claude Desktop has no channel launch flag, so a Desktop session can't self‑inject the way a CLI
+session does. But Desktop exposes a built‑in `ccd_session_mgmt.send_message` tool that injects a turn
+into another session — so switchboard can **broker** it: it can't call that tool itself (an MCP
+server can't invoke another server's tools), but it can hand the *sender's* Claude everything needed
+to make the call.
+
+```bash
+# Register the stdio server with Desktop injection enabled:
+claude mcp add --scope user --env SWITCHBOARD_CCD_INJECT=1 -- switchboard-relay
+```
+
+How it flows: each session's switchboard **auto‑captures its own** CCD id at `register()`
+(`local_<CLAUDE_CODE_SESSION_ID>`, which Claude Code puts in the server's env) and stores it on the
+board. When you `send(to=X)`, the result carries an `inject` field with X's `session_id` and a
+ready‑to‑send message; the sender's Claude then calls `ccd_session_mgmt.send_message(...)` and X
+reacts. No session ever discloses its id to another — each records only its own.
+
+**The honest caveats:**
+
+- **One approval click per message.** `send_message` is on a hardcoded list in the Desktop client
+  (alongside `AskUserQuestion`/`ExitPlanMode`) that **always** prompts you to approve — it's the
+  guardrail against one session silently driving another, and there is **no setting to disable it**.
+- **The sender must be a Desktop/Cowork session** (only those have the `ccd_session_mgmt` tools). The
+  *reactor* is Desktop; a pure terminal `claude` can't be the injecting sender. So this is the mirror
+  image of the CLI path.
+- **`ask()` isn't covered** — it blocks the sender while waiting, so the sender can't inject mid‑call.
+  Use `send()` for a Desktop reactor (it replies with its own `send()`), or make the reactor a CLI
+  session.
+- **The CCD id derivation** (`local_<CLAUDE_CODE_SESSION_ID>`) holds for a normal top‑level session;
+  in an **agent/child** context the env id isn't the addressable one, so set
+  `SWITCHBOARD_CCD_SESSION_ID=<full id>` to override. Confirm once with the two‑session check below.
+- Best‑effort and **idempotent**: the injected turn is a body‑less nudge (the real message stays in
+  the durable inbox and drains exactly once), so even if a recipient *also* has the CLI watcher, a
+  double nudge can't double‑deliver.
 
 ### What's actually sent (and why it stays exactly‑once)
 

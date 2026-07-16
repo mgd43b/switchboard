@@ -40,10 +40,11 @@ DEFAULT_TTL_SECONDS = 300.0
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS participants (
-    name          TEXT PRIMARY KEY,
-    role          TEXT NOT NULL DEFAULT '',
-    last_seen     REAL NOT NULL,
-    registered_at REAL NOT NULL
+    name            TEXT PRIMARY KEY,
+    role            TEXT NOT NULL DEFAULT '',
+    last_seen       REAL NOT NULL,
+    registered_at   REAL NOT NULL,
+    ccd_session_id  TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -76,6 +77,11 @@ class Participant:
     role: str
     last_seen: float
     registered_at: float
+    # The CCD (Claude Desktop) session id used to inject a turn into this
+    # participant via ccd_session_mgmt.send_message. Empty unless the session
+    # registered with turn-injection-on-Desktop enabled. Deliberately kept out
+    # of to_dict() so raw session ids don't surface in participants() output.
+    ccd_session_id: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -187,6 +193,7 @@ class Store:
             if str(self.db_path) != ":memory:":
                 _enable_wal(conn)
             _with_lock_retry(lambda: conn.executescript(_SCHEMA))
+            _with_lock_retry(lambda: _migrate_participants(conn))
 
     def close(self) -> None:
         if self._memory_conn is not None:
@@ -195,38 +202,50 @@ class Store:
 
     # -- participants -------------------------------------------------------
 
-    def register(self, name: str, role: str = "", *, now: float) -> Participant:
+    def register(
+        self, name: str, role: str = "", *, now: float, ccd_session_id: str = ""
+    ) -> Participant:
         """Register a new participant or refresh an existing one's heartbeat.
 
         Re-registering an existing ``name`` updates its ``role`` (if a non-empty
-        role is supplied) and always refreshes ``last_seen``.
+        role is supplied), refreshes ``ccd_session_id`` (if a non-empty one is
+        supplied), and always refreshes ``last_seen``.
         """
         name = _require_name(name)
         role = (role or "").strip()
+        ccd = (ccd_session_id or "").strip()
         with self._connect() as conn:
             # Atomic upsert: create the participant or refresh it in ONE
             # statement. A check-then-insert (SELECT then INSERT) would race --
             # two processes claiming the same name concurrently both see no row
             # and both INSERT, and the second dies on the PRIMARY KEY. The
             # ON CONFLICT clause makes create-or-refresh a single atomic write:
-            # it preserves the original registered_at and keeps the prior role
-            # when the refresh omits one.
+            # it preserves the original registered_at and keeps the prior role /
+            # ccd_session_id when the refresh omits one.
             _with_lock_retry(
                 lambda: conn.execute(
-                    "INSERT INTO participants (name, role, last_seen, registered_at) "
-                    "VALUES (:name, :role, :now, :now) "
+                    "INSERT INTO participants (name, role, last_seen, registered_at, "
+                    "  ccd_session_id) VALUES (:name, :role, :now, :now, :ccd) "
                     "ON CONFLICT(name) DO UPDATE SET "
                     "  role = CASE WHEN excluded.role != '' "
                     "              THEN excluded.role ELSE participants.role END, "
+                    "  ccd_session_id = CASE WHEN excluded.ccd_session_id != '' "
+                    "              THEN excluded.ccd_session_id "
+                    "              ELSE participants.ccd_session_id END, "
                     "  last_seen = excluded.last_seen",
-                    {"name": name, "role": role, "now": now},
+                    {"name": name, "role": role, "now": now, "ccd": ccd},
                 )
             )
             row = conn.execute(
-                "SELECT role, registered_at FROM participants WHERE name = ?", (name,)
+                "SELECT role, registered_at, ccd_session_id FROM participants WHERE name = ?",
+                (name,),
             ).fetchone()
         return Participant(
-            name=name, role=row["role"], last_seen=now, registered_at=row["registered_at"]
+            name=name,
+            role=row["role"],
+            last_seen=now,
+            registered_at=row["registered_at"],
+            ccd_session_id=row["ccd_session_id"],
         )
 
     def unregister(self, name: str) -> bool:
@@ -258,7 +277,7 @@ class Store:
         cutoff = now - ttl
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT name, role, last_seen, registered_at FROM participants "
+                "SELECT name, role, last_seen, registered_at, ccd_session_id FROM participants "
                 "WHERE last_seen >= ? ORDER BY last_seen DESC",
                 (cutoff,),
             ).fetchall()
@@ -268,6 +287,7 @@ class Store:
                 role=r["role"],
                 last_seen=r["last_seen"],
                 registered_at=r["registered_at"],
+                ccd_session_id=r["ccd_session_id"],
             )
             for r in rows
         ]
@@ -455,6 +475,19 @@ def _with_lock_retry(fn, *, attempts: int = 200, delay: float = 0.02):
                 raise
             time.sleep(delay)
     return fn()  # final attempt: let a genuine error propagate
+
+
+def _migrate_participants(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after the original schema to an existing DB.
+
+    ``CREATE TABLE IF NOT EXISTS`` is a no-op on a database created by an older
+    version, so a new column has to be added explicitly. Currently just
+    ``ccd_session_id`` (turn injection on Desktop). Idempotent: checks the
+    column list first, and a fresh DB already has it from ``_SCHEMA``.
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(participants)").fetchall()}
+    if "ccd_session_id" not in cols:
+        conn.execute("ALTER TABLE participants ADD COLUMN ccd_session_id TEXT NOT NULL DEFAULT ''")
 
 
 def _enable_wal(conn: sqlite3.Connection) -> None:

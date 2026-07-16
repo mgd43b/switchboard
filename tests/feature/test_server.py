@@ -19,6 +19,8 @@ from switchboard_relay.server import (
     _CHANNEL_CAPABILITY,
     _CHANNEL_METHOD,
     Switchboard,
+    _resolve_ccd_inject,
+    _resolve_ccd_session_id,
     _resolve_push,
     build_server,
 )
@@ -728,3 +730,113 @@ def test_watch_loop_delivers_reticks_then_cancels(board, monkeypatch):
     anyio.run(drive)
     assert ctx.session.sent  # nudged its own client
     assert board.store.has_messages("lead")  # peeked, not drained
+
+
+# -- turn injection on Desktop (ccd_session_mgmt broker) --------------------
+
+
+def test_resolve_ccd_session_id(monkeypatch):
+    monkeypatch.delenv("SWITCHBOARD_CCD_SESSION_ID", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    assert _resolve_ccd_session_id() == ""  # nothing to derive from
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "abc-123")
+    assert _resolve_ccd_session_id() == "local_abc-123"  # top-level derivation
+    monkeypatch.setenv("SWITCHBOARD_CCD_SESSION_ID", "local_override")
+    assert _resolve_ccd_session_id() == "local_override"  # explicit override wins verbatim
+
+
+def test_resolve_ccd_inject(monkeypatch):
+    monkeypatch.delenv("SWITCHBOARD_CCD_INJECT", raising=False)
+    assert _resolve_ccd_inject() is False  # off by default
+    monkeypatch.setenv("SWITCHBOARD_CCD_INJECT", "1")
+    assert _resolve_ccd_inject() is True
+
+
+def _sender_board(board):
+    """Turn `board` into a ccd-inject-enabled sender identified as local_SENDER."""
+    board._ccd_inject = True
+    board._my_ccd_id = "local_SENDER"
+    return board
+
+
+def test_ccd_inject_off_by_default_no_hint_no_capture(board):
+    # Without the flag: no ccd id is stored and send() carries no inject hint.
+    a = _ctx()
+    board.register(a, "worker")
+    board.store.register("lead", "", now=time.time(), ccd_session_id="local_LEAD")
+    res = _run(board.send_async, a, "lead", "hi")
+    assert "inject" not in res
+
+
+def test_ccd_inject_returns_recipient_target(board):
+    _sender_board(board)
+    a = _ctx()
+    board.register(a, "worker")
+    # Recipient "lead" registered from its own process with its CCD id.
+    board.store.register("lead", "", now=time.time(), ccd_session_id="local_LEAD")
+    # A ccd-capable bystander who is NOT addressed must not be injected into.
+    board.store.register("other", "", now=time.time(), ccd_session_id="local_OTHER")
+    res = _run(board.send_async, a, "lead", "please review PR #23")
+    assert res["inject"]["targets"] == [
+        {
+            "session_id": "local_LEAD",
+            "message": f"New switchboard message (id {res['id']}) is waiting for you. "
+            "Call inbox() to read and handle it.",
+        }
+    ]
+    # Body-less: the real message text is never in the injected turn (keeps the
+    # cross-session prompt-injection surface minimal).
+    assert "PR #23" not in res["inject"]["targets"][0]["message"]
+    assert "instructions" in res["inject"]
+
+
+def test_ccd_inject_role_targets_all_members_except_sender(board):
+    _sender_board(board)
+    lead = _ctx()
+    board.register(lead, "lead")
+    # Two workers registered (as if from their own processes) with CCD ids.
+    board.store.register("worker:1", "worker", now=time.time(), ccd_session_id="local_W1")
+    board.store.register("worker:2", "worker", now=time.time(), ccd_session_id="local_W2")
+    res = _run(board.send_async, lead, "worker", "all hands")
+    ids = {t["session_id"] for t in res["inject"]["targets"]}
+    assert ids == {"local_W1", "local_W2"}
+
+
+def test_ccd_inject_skips_peers_without_a_ccd_id(board):
+    _sender_board(board)
+    a = _ctx()
+    board.register(a, "worker")
+    board.store.register("lead", "", now=time.time())  # no CCD id recorded
+    res = _run(board.send_async, a, "lead", "hi")
+    assert "inject" not in res  # nothing to inject into
+
+
+def test_ccd_inject_never_targets_the_sender(board):
+    # A role the sender itself belongs to must not inject a turn back into it.
+    _sender_board(board)
+    a = _ctx()
+    board.register(a, "worker:me", "team")
+    board.store.register("worker:me", "team", now=time.time(), ccd_session_id="local_SENDER")
+    board.store.register("worker:you", "team", now=time.time(), ccd_session_id="local_YOU")
+    res = _run(board.send_async, a, "team", "standup")
+    ids = {t["session_id"] for t in res["inject"]["targets"]}
+    assert ids == {"local_YOU"}  # not local_SENDER
+
+
+def test_ccd_inject_broadcast_returns_targets(board):
+    _sender_board(board)
+    a = _ctx()
+    board.register(a, "lead")
+    board.store.register("worker:1", "worker", now=time.time(), ccd_session_id="local_W1")
+    out = _run(board.broadcast, a, "ship it")
+    assert {t["session_id"] for t in out["inject"]["targets"]} == {"local_W1"}
+    assert "broadcast" in out["inject"]["targets"][0]["message"].lower()
+
+
+def test_register_persists_ccd_id_when_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("SWITCHBOARD_CCD_INJECT", "1")
+    monkeypatch.setenv("SWITCHBOARD_CCD_SESSION_ID", "local_ME")
+    sb = Switchboard(Store(tmp_path / "sb.db"), ttl=300)
+    sb.register(_ctx(), "lead")
+    p = next(x for x in sb.store.participants(now=time.time(), ttl=300) if x.name == "lead")
+    assert p.ccd_session_id == "local_ME"

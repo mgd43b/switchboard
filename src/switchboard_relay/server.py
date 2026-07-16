@@ -163,6 +163,34 @@ def _resolve_push(*, daemon: bool) -> bool:
     return daemon
 
 
+def _resolve_ccd_inject() -> bool:
+    """Whether to offer Desktop turn injection via ccd_session_mgmt.send_message.
+
+    Off by default: it's a Claude Desktop-specific accelerator that leans on an
+    internal tool and adds a per-message approval prompt on the sender. Opt in
+    with ``$SWITCHBOARD_CCD_INJECT=1``.
+    """
+    return (os.environ.get("SWITCHBOARD_CCD_INJECT") or "").strip().lower() in _PUSH_TRUE
+
+
+def _resolve_ccd_session_id() -> str:
+    """This session's CCD (Claude Desktop) session id, for turn injection.
+
+    A peer session injects a turn into us by calling
+    ``ccd_session_mgmt.send_message(session_id=...)``. That id is
+    ``local_<CLAUDE_CODE_SESSION_ID>`` for a normal top-level session (Claude
+    Code injects ``CLAUDE_CODE_SESSION_ID`` into our process env, like
+    ``CLAUDE_PROJECT_DIR``). ``$SWITCHBOARD_CCD_SESSION_ID`` overrides it verbatim
+    for contexts where the derivation is wrong (e.g. an agent/child session,
+    whose env id is not the addressable one). Empty when neither is available.
+    """
+    override = (os.environ.get("SWITCHBOARD_CCD_SESSION_ID") or "").strip()
+    if override:
+        return override
+    sid = (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
+    return f"local_{sid}" if sid else ""
+
+
 def _clamp_timeout(value: Any, *, default: float = 30.0, cap: float = 3600.0) -> float:
     """Coerce a caller-supplied timeout to a sane [0, cap] range."""
     try:
@@ -234,6 +262,12 @@ class Switchboard:
         # nudged about) so the stdio watcher nudges once per new message, not on
         # every poll. See _watch_tick.
         self._watch_hw: dict[int, int] = {}
+        # Turn injection on Desktop (opt-in): capture this session's CCD id so a
+        # peer can inject a turn into us via ccd_session_mgmt.send_message, and
+        # have send() hand the sender ready-to-use injection payloads. See
+        # _ccd_targets and _resolve_ccd_session_id.
+        self._ccd_inject = _resolve_ccd_inject()
+        self._my_ccd_id = _resolve_ccd_session_id()
 
     # -- identity -----------------------------------------------------------
 
@@ -249,7 +283,9 @@ class Switchboard:
             return conn
         if self._default_name:
             # Lazily register the environment-seeded identity for this session.
-            self.store.register(self._default_name, self._default_role, now=_now())
+            self.store.register(
+                self._default_name, self._default_role, now=_now(), ccd_session_id=self._ccd_id()
+            )
             return self._bind(ctx, self._default_name, self._default_role)
         raise ValueError(
             'This session is not registered. Call register(name="...", '
@@ -316,7 +352,7 @@ class Switchboard:
         # never disturbs the role.
         if not role and not explicit_name:
             role = self._default_role
-        p = self.store.register(name, role, now=_now())
+        p = self.store.register(name, role, now=_now(), ccd_session_id=self._ccd_id())
         self._bind(ctx, p.name, p.role)
         payload = self._participants_payload()
         out = {
@@ -492,6 +528,60 @@ class Switchboard:
                 await self._watch_tick(heartbeat=do_heartbeat)
             await anyio.sleep(_WATCH_POLL_SECONDS)
 
+    # -- turn injection on Desktop (ccd_session_mgmt broker) ----------------
+
+    def _ccd_id(self) -> str:
+        """This session's CCD id to record at register(), or '' if injection is off."""
+        return self._my_ccd_id if self._ccd_inject else ""
+
+    def _ccd_targets(self, to: str, *, sender: str, mid: int) -> list[dict]:
+        """Ready-to-send ``ccd_session_mgmt.send_message`` payloads for the live
+        recipient(s) of ``to`` that can be turn-injected on Claude Desktop.
+
+        Empty unless ccd injection is enabled. switchboard (an MCP server) can't
+        call ``send_message`` itself -- only the model can -- so ``send()`` hands
+        these back and the *sender's* Claude makes the call (which prompts the
+        user). The ``message`` is a body-less nudge, never the message text: the
+        recipient reads the real message from its durable inbox, so a
+        cross-session injected turn carries no sender-controlled content, keeping
+        the prompt-injection surface minimal. Drain-once is unaffected -- the
+        injected turn just prompts an ``inbox()`` that drains exactly once.
+        """
+        if not self._ccd_inject:
+            return []
+        out = []
+        for p in self.store.participants(now=_now(), ttl=self.ttl):
+            if p.name == sender or not p.ccd_session_id:
+                continue  # never inject into the sender; skip peers with no CCD id
+            if p.name == to or (p.role and p.role == to):
+                out.append(
+                    {
+                        "session_id": p.ccd_session_id,
+                        "message": (
+                            f"New switchboard message (id {mid}) is waiting for you. "
+                            "Call inbox() to read and handle it."
+                        ),
+                    }
+                )
+        return out
+
+    def _inject_hint(self, targets: list[dict]) -> Optional[dict]:
+        """Wrap ccd targets into the ``inject`` field of a tool result, or None."""
+        if not targets:
+            return None
+        return {
+            "instructions": (
+                "Desktop turn injection is enabled. To make the recipient react "
+                "immediately, call ccd_session_mgmt.send_message once for each target "
+                "below (pass its session_id and message). Each call asks the user to "
+                "approve. This is optional and best-effort: the message is already "
+                "delivered durably and the recipient also receives it by polling "
+                "inbox()/wait() -- skip it for a terminal (CLI) recipient, which "
+                "reacts on its own via the switchboard watcher."
+            ),
+            "targets": targets,
+        }
+
     async def send_async(
         self, ctx: Context, to: str, body: str, reply_to: Optional[int] = None
     ) -> dict:
@@ -499,6 +589,11 @@ class Switchboard:
         result["delivered_live"] = await self._notify(
             ctx, sender=result["from"], to=result["to"], mid=result["id"], reply_to=reply_to
         )
+        hint = self._inject_hint(
+            self._ccd_targets(result["to"], sender=result["from"], mid=result["id"])
+        )
+        if hint:
+            result["inject"] = hint
         return result
 
     async def ask(self, ctx: Context, to: str, body: str, timeout_s: float = 30.0) -> dict:
@@ -567,12 +662,27 @@ class Switchboard:
             p for p in self.store.participants(now=now, ttl=self.ttl) if p.name != conn.name
         ]
         delivered = []
+        inject_targets = []
         for p in recipients:
             mid = self.store.send(p.name, body, sender=conn.name, now=now)
             live = await self._notify(ctx, sender=conn.name, to=p.name, mid=mid, reply_to=None)
             delivered.append({"to": p.name, "id": mid, "delivered_live": live})
+            if self._ccd_inject and p.ccd_session_id:
+                inject_targets.append(
+                    {
+                        "session_id": p.ccd_session_id,
+                        "message": (
+                            f"New switchboard broadcast (id {mid}) is waiting for you. "
+                            "Call inbox() to read and handle it."
+                        ),
+                    }
+                )
         self.store.touch(conn.name, now=_now())
-        return {"from": conn.name, "delivered": delivered, "count": len(delivered)}
+        out = {"from": conn.name, "delivered": delivered, "count": len(delivered)}
+        hint = self._inject_hint(inject_targets)
+        if hint:
+            out["inject"] = hint
+        return out
 
     def unregister(self, ctx: Context) -> dict:
         """Remove the caller from the participant registry (a clean leave)."""
@@ -803,7 +913,10 @@ def build_server(
         Delivery is durable -- the message waits even if `to` is offline or has
         not registered yet. Returns the new message `id`; if no live participant
         currently reads `to`, the result also carries `no_live_recipient` and a
-        `warning` (most often a typo'd name/role).
+        `warning` (most often a typo'd name/role). If the result carries an
+        `inject` field (Desktop turn injection is enabled), follow its
+        `instructions` to make the recipient react immediately -- it is optional
+        and best-effort on top of durable delivery.
         """
         return await sb.send_async(ctx, to, body, reply_to)
 
@@ -991,6 +1104,8 @@ _DOCTOR_ENV_VARS = (
     "SWITCHBOARD_NAME",
     "SWITCHBOARD_ROLE",
     "SWITCHBOARD_PUSH",
+    "SWITCHBOARD_CCD_INJECT",
+    "SWITCHBOARD_CCD_SESSION_ID",
 )
 
 
