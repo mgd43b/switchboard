@@ -8,13 +8,28 @@ by test_integration.py).
 
 from __future__ import annotations
 
+import functools
 import re
 import time
 
+import anyio
 import pytest
 
-from switchboard_relay.server import _CHANNEL_METHOD, Switchboard
+from switchboard_relay.server import (
+    _CHANNEL_CAPABILITY,
+    _CHANNEL_METHOD,
+    Switchboard,
+    _resolve_ccd_inject,
+    _resolve_ccd_session_id,
+    _resolve_push,
+    build_server,
+)
 from switchboard_relay.store import Store
+
+# The channel client only keeps meta keys that are plain identifiers; anything
+# else is silently dropped before the <channel> tag is rendered. Mirror that
+# rule here so a regression into e.g. a hyphenated key is caught in CI.
+_META_KEY_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 
 class FakeSession:
@@ -218,7 +233,7 @@ def test_msg_ttl_zero_disables_ageout(tmp_path):
     assert [m.body for m in sb.store.inbox("lead", peek=True)] == ["ancient"]
 
 
-# -- daemon registry eviction (#18) -----------------------------------------
+# -- connection registry eviction (#18) -------------------------------------
 
 
 def test_conns_evicted_when_participant_expires(tmp_path):
@@ -325,15 +340,6 @@ def test_ask_rejects_empty_recipient(board):
         _run(board.ask, ctx, "", "q")
 
 
-def test_push_enabled_but_no_connected_target_is_not_live(board):
-    board._push_enabled = True
-    a = _ctx()
-    board.register(a, "lead")
-    # Nobody is connected under "nobody-here", so push finds no target.
-    res = _run(board.send_async, a, "nobody-here", "hi")
-    assert res["delivered_live"] is False
-
-
 def test_broadcast_reaches_all_live_except_sender(board):
     a, b, c = _ctx(), _ctx(), _ctx()
     board.register(a, "lead")
@@ -419,7 +425,7 @@ def test_env_seeded_identity(tmp_path, monkeypatch):
 # -- send / participants ----------------------------------------------------
 
 
-def test_send_returns_id_and_no_live_delivery_by_default(board):
+def test_send_returns_id_and_pushes_nothing_by_default(board):
     a, b = _ctx(), _ctx()
     board.register(a, "lead")
     board.register(b, "worker")
@@ -429,7 +435,8 @@ def test_send_returns_id_and_no_live_delivery_by_default(board):
     res = anyio.run(board.send_async, a, "worker", "ping")
     assert isinstance(res["id"], int)
     assert res["from"] == "lead"
-    assert res["delivered_live"] is False  # push disabled by default
+    # No self-push and no ccd inject hint by default (both are opt-in).
+    assert "inject" not in res
     assert b.session.sent == []
 
 
@@ -444,7 +451,7 @@ def test_participants_lists_live_and_counts(board):
     assert all("idle_seconds" in p for p in out["participants"])
 
 
-# -- opt-in push ------------------------------------------------------------
+# -- push helper ------------------------------------------------------------
 
 
 def _run(coro_fn, *args):
@@ -453,66 +460,284 @@ def _run(coro_fn, *args):
     return anyio.run(coro_fn, *args)
 
 
-def test_push_delivers_to_connected_recipient_when_enabled(board):
+# -- channel capability + push defaults -------------------------------------
+
+
+def test_build_server_declares_channel_capability():
+    # Turn injection only works if the server advertises the Channels capability
+    # in its initialize response; both transports build options via this call.
+    mcp = build_server(Store(":memory:"), ttl=300, board="cap")
+    caps = mcp._mcp_server.create_initialization_options().capabilities
+    # Assert the key is present and exactly {} rather than exact-matching the
+    # whole dict, so this doesn't break if the SDK starts advertising other
+    # experimental capabilities by default.
+    assert (caps.experimental or {}).get(_CHANNEL_CAPABILITY) == {}
+    # Declaring it must not clobber the real tools capability.
+    assert caps.tools is not None
+    # Our capability is forced last: a caller can't override it to a non-{}
+    # value, but their other experimental capabilities are preserved.
+    caps2 = mcp._mcp_server.create_initialization_options(
+        experimental_capabilities={_CHANNEL_CAPABILITY: {"bogus": 1}, "other": {}}
+    ).capabilities
+    assert caps2.experimental[_CHANNEL_CAPABILITY] == {}
+    assert caps2.experimental["other"] == {}
+
+
+def test_push_off_by_default_on_and_off_via_env(monkeypatch):
+    monkeypatch.delenv("SWITCHBOARD_PUSH", raising=False)
+    assert _resolve_push() is False  # off by default (stdio background poll cost)
+    assert Switchboard(Store(":memory:"))._push_enabled is False
+    monkeypatch.setenv("SWITCHBOARD_PUSH", "1")
+    assert _resolve_push() is True
+    monkeypatch.setenv("SWITCHBOARD_PUSH", "off")
+    assert _resolve_push() is False
+
+
+# -- stdio self-watch (turn injection without a daemon) ---------------------
+
+
+def _tick(board, **kw):
+    return anyio.run(functools.partial(board._watch_tick, **kw))
+
+
+def test_watch_tick_nudges_local_session_and_leaves_message(board):
+    # The stdio watcher self-nudges its own client about a message that landed
+    # on the shared board (written here as if by another process's send()), and
+    # the emitted notification has the full Channels shape.
     board._push_enabled = True
-    a, b = _ctx(), _ctx()
-    board.register(a, "lead")
-    board.register(b, "worker:x", "worker")
+    ctx = _ctx()
+    board.register(ctx, "lead")
+    board.store.send("lead", "hello", sender="worker", reply_to=41, now=time.time())
 
-    res = _run(board.send_async, a, "worker:x", "hello there")
-    assert res["delivered_live"] is True
-    assert len(b.session.sent) == 1
-
-    dumped = b.session.sent[0].model_dump(by_alias=True, mode="json", exclude_none=True)
+    assert _tick(board) == 1
+    dumped = ctx.session.sent[0].model_dump(by_alias=True, mode="json", exclude_none=True)
     assert dumped["method"] == _CHANNEL_METHOD
-    assert dumped["params"]["meta"]["msg_from"] == "lead"
-    assert dumped["params"]["meta"]["msg_id"] == str(res["id"])
-    # The push is a body-less nudge to check inbox, NOT the message content --
-    # the durable row is the single source of truth (see role fan-out below).
-    assert "inbox" in dumped["params"]["content"].lower()
-    assert "hello there" not in dumped["params"]["content"]
-    # The message body is delivered durably, drained once via inbox().
-    assert [m["body"] for m in board.inbox(b)["messages"]] == ["hello there"]
+    meta = dumped["params"]["meta"]
+    assert meta["msg_from"] == "worker"
+    assert meta["msg_to"] == "lead"
+    assert meta["reply_to"] == "41"
+    # No "source" key (the client sets it from the server name); every key is a
+    # bare identifier or the client silently drops it.
+    assert "source" not in meta
+    assert all(_META_KEY_RE.match(k) for k in meta)
+    # Reactive, body-less nudge: tells the recipient to drain inbox() and act,
+    # and never carries the message text (the durable row is the source of truth).
+    content = dumped["params"]["content"].lower()
+    assert "inbox()" in content
+    assert "react" in content or "act on" in content
+    assert "hello" not in dumped["params"]["content"]
+    # Peeked, NOT drained: the durable row is untouched and still deliverable.
+    assert board.store.has_messages("lead")
 
 
-def test_push_includes_reply_to_in_meta(board):
+def test_watch_tick_role_message_reports_role_as_msg_to(board):
+    # A role-addressed message must nudge with msg_to = the role (the message's
+    # stored recipient), not the reader's name.
     board._push_enabled = True
-    a, b = _ctx(), _ctx()
-    board.register(a, "lead")
-    board.register(b, "worker:x", "worker")
-    res = _run(board.send_async, a, "worker:x", "re: your question", 41)
-    dumped = b.session.sent[0].model_dump(by_alias=True, mode="json", exclude_none=True)
-    assert dumped["params"]["meta"]["reply_to"] == "41"
-    assert res["reply_to"] == 41
+    ctx = _ctx()
+    board.register(ctx, "worker:7", "worker")
+    board.store.send("worker", "any worker?", sender="lead", now=time.time())  # to the role
+    assert _tick(board) == 1
+    dumped = ctx.session.sent[0].model_dump(by_alias=True, mode="json", exclude_none=True)
+    assert dumped["params"]["meta"]["msg_to"] == "worker"
 
 
-def test_push_by_role_targets_all_matching_and_excludes_sender(board):
+def test_watch_tick_does_not_renudge_same_message(board):
     board._push_enabled = True
-    lead = _ctx()
-    w1, w2 = _ctx(), _ctx()
-    board.register(lead, "lead")
-    board.register(w1, "worker:1", "worker")
-    board.register(w2, "worker:2", "worker")
-
-    res = _run(board.send_async, lead, "worker", "all-hands")
-    assert res["delivered_live"] is True
-    assert len(w1.session.sent) == 1
-    assert len(w2.session.sent) == 1
-    assert lead.session.sent == []  # sender never pushed to itself
+    ctx = _ctx()
+    board.register(ctx, "lead")
+    board.store.send("lead", "one", sender="worker", now=time.time())
+    assert _tick(board) == 1
+    assert _tick(board) == 0  # high-water mark: no repeat nudge for the same row
+    assert len(ctx.session.sent) == 1
 
 
-def test_push_never_raises_on_bad_session(board):
+def test_watch_tick_renudges_on_a_new_message(board):
+    board._push_enabled = True
+    ctx = _ctx()
+    board.register(ctx, "lead")
+    board.store.send("lead", "one", sender="worker", now=time.time())
+    assert _tick(board) == 1
+    board.store.send("lead", "two", sender="worker", now=time.time())
+    assert _tick(board) == 1  # a genuinely new message earns a fresh nudge
+    assert len(ctx.session.sent) == 2
+
+
+def test_watch_tick_heartbeat_keeps_connected_session_live(board):
+    # A connected-but-idle session must stay in the live registry so senders
+    # don't see a false no_live_recipient. A heartbeat tick refreshes it.
+    board._push_enabled = True
+    ctx = _ctx()
+    board.register(ctx, "lead")
+    board.store.register("lead", "", now=time.time() - 10_000)  # force it stale
+    assert board._has_live_recipient("lead") is False
+    _tick(board, heartbeat=True)
+    assert board._has_live_recipient("lead") is True
+
+
+def test_watch_tick_best_effort_on_bad_session(board):
+    # A recipient whose session errors on push must not raise, and the watcher
+    # must not spin retrying it (the high-water mark still advances).
     board._push_enabled = True
 
     class Boom:
         async def send_notification(self, *a, **k):
             raise RuntimeError("stream closed")
 
-    sender, recip = _ctx(), FakeCtx(Boom())
-    board.register(sender, "lead")
-    board.register(recip, "worker:x", "worker")
-    # Must not raise even though the recipient's session errors on push.
-    res = _run(board.send_async, sender, "worker:x", "hi")
-    assert res["delivered_live"] is False
-    # Durable delivery still succeeded.
-    assert board.store.has_messages("worker:x", "worker")
+    ctx = FakeCtx(Boom())
+    board.register(ctx, "lead")
+    board.store.send("lead", "hi", sender="worker", now=time.time())
+    assert _tick(board) == 0  # push failed -> not counted, but no raise
+    assert _tick(board) == 0  # and no retry storm on the same row
+    assert board.store.has_messages("lead")  # still durable
+
+
+def test_watch_loop_noop_when_push_off():
+    # With push disabled the loop returns immediately rather than spinning.
+    anyio.run(Switchboard(Store(":memory:"), ttl=300)._watch_loop)
+
+
+def test_watch_loop_delivers_reticks_then_cancels(board, monkeypatch):
+    # Exercise the real background loop across multiple iterations (fast poll):
+    # it heartbeats on the first tick, skips the heartbeat on the next, nudges
+    # the connected session about a queued message, and stops cleanly on cancel.
+    import switchboard_relay.server as server_mod
+
+    monkeypatch.setattr(server_mod, "_WATCH_POLL_SECONDS", 0.01)  # iterate quickly
+    board._push_enabled = True
+    ctx = _ctx()
+    board.register(ctx, "lead")
+    board.store.send("lead", "async ping", sender="worker", now=time.time())
+
+    ticks = 0
+    original = board._watch_tick
+
+    async def spy(**kw):
+        nonlocal ticks
+        ticks += 1
+        return await original(**kw)
+
+    monkeypatch.setattr(board, "_watch_tick", spy)
+
+    async def drive():
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(board._watch_loop)
+            with anyio.fail_after(3):
+                # >=2 ticks so the second (non-heartbeat) iteration also runs.
+                while ticks < 2 or not ctx.session.sent:
+                    await anyio.sleep(0.005)
+            tg.cancel_scope.cancel()
+
+    anyio.run(drive)
+    assert ctx.session.sent  # nudged its own client
+    assert board.store.has_messages("lead")  # peeked, not drained
+
+
+# -- turn injection on Desktop (ccd_session_mgmt broker) --------------------
+
+
+def test_resolve_ccd_session_id(monkeypatch):
+    monkeypatch.delenv("SWITCHBOARD_CCD_SESSION_ID", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    assert _resolve_ccd_session_id() == ""  # nothing to derive from
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "abc-123")
+    assert _resolve_ccd_session_id() == "local_abc-123"  # top-level derivation
+    monkeypatch.setenv("SWITCHBOARD_CCD_SESSION_ID", "local_override")
+    assert _resolve_ccd_session_id() == "local_override"  # explicit override wins verbatim
+
+
+def test_resolve_ccd_inject(monkeypatch):
+    monkeypatch.delenv("SWITCHBOARD_CCD_INJECT", raising=False)
+    assert _resolve_ccd_inject() is False  # off by default
+    monkeypatch.setenv("SWITCHBOARD_CCD_INJECT", "1")
+    assert _resolve_ccd_inject() is True
+
+
+def _sender_board(board):
+    """Turn `board` into a ccd-inject-enabled sender identified as local_SENDER."""
+    board._ccd_inject = True
+    board._my_ccd_id = "local_SENDER"
+    return board
+
+
+def test_ccd_inject_off_by_default_no_hint_no_capture(board):
+    # Without the flag: no ccd id is stored and send() carries no inject hint.
+    a = _ctx()
+    board.register(a, "worker")
+    board.store.register("lead", "", now=time.time(), ccd_session_id="local_LEAD")
+    res = _run(board.send_async, a, "lead", "hi")
+    assert "inject" not in res
+
+
+def test_ccd_inject_returns_recipient_target(board):
+    _sender_board(board)
+    a = _ctx()
+    board.register(a, "worker")
+    # Recipient "lead" registered from its own process with its CCD id.
+    board.store.register("lead", "", now=time.time(), ccd_session_id="local_LEAD")
+    # A ccd-capable bystander who is NOT addressed must not be injected into.
+    board.store.register("other", "", now=time.time(), ccd_session_id="local_OTHER")
+    res = _run(board.send_async, a, "lead", "please review PR #23")
+    assert res["inject"]["targets"] == [
+        {
+            "session_id": "local_LEAD",
+            "message": f"New switchboard message (id {res['id']}) is waiting for you. "
+            "Call inbox() to read and handle it.",
+        }
+    ]
+    # Body-less: the real message text is never in the injected turn (keeps the
+    # cross-session prompt-injection surface minimal).
+    assert "PR #23" not in res["inject"]["targets"][0]["message"]
+    assert "instructions" in res["inject"]
+
+
+def test_ccd_inject_role_targets_all_members_except_sender(board):
+    _sender_board(board)
+    lead = _ctx()
+    board.register(lead, "lead")
+    # Two workers registered (as if from their own processes) with CCD ids.
+    board.store.register("worker:1", "worker", now=time.time(), ccd_session_id="local_W1")
+    board.store.register("worker:2", "worker", now=time.time(), ccd_session_id="local_W2")
+    res = _run(board.send_async, lead, "worker", "all hands")
+    ids = {t["session_id"] for t in res["inject"]["targets"]}
+    assert ids == {"local_W1", "local_W2"}
+
+
+def test_ccd_inject_skips_peers_without_a_ccd_id(board):
+    _sender_board(board)
+    a = _ctx()
+    board.register(a, "worker")
+    board.store.register("lead", "", now=time.time())  # no CCD id recorded
+    res = _run(board.send_async, a, "lead", "hi")
+    assert "inject" not in res  # nothing to inject into
+
+
+def test_ccd_inject_never_targets_the_sender(board):
+    # A role the sender itself belongs to must not inject a turn back into it.
+    _sender_board(board)
+    a = _ctx()
+    board.register(a, "worker:me", "team")
+    board.store.register("worker:me", "team", now=time.time(), ccd_session_id="local_SENDER")
+    board.store.register("worker:you", "team", now=time.time(), ccd_session_id="local_YOU")
+    res = _run(board.send_async, a, "team", "standup")
+    ids = {t["session_id"] for t in res["inject"]["targets"]}
+    assert ids == {"local_YOU"}  # not local_SENDER
+
+
+def test_ccd_inject_broadcast_returns_targets(board):
+    _sender_board(board)
+    a = _ctx()
+    board.register(a, "lead")
+    board.store.register("worker:1", "worker", now=time.time(), ccd_session_id="local_W1")
+    out = _run(board.broadcast, a, "ship it")
+    assert {t["session_id"] for t in out["inject"]["targets"]} == {"local_W1"}
+    assert "broadcast" in out["inject"]["targets"][0]["message"].lower()
+
+
+def test_register_persists_ccd_id_when_enabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("SWITCHBOARD_CCD_INJECT", "1")
+    monkeypatch.setenv("SWITCHBOARD_CCD_SESSION_ID", "local_ME")
+    sb = Switchboard(Store(tmp_path / "sb.db"), ttl=300)
+    sb.register(_ctx(), "lead")
+    p = next(x for x in sb.store.participants(now=time.time(), ttl=300) if x.name == "lead")
+    assert p.ccd_session_id == "local_ME"

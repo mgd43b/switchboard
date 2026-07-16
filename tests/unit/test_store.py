@@ -62,6 +62,40 @@ def test_register_rejects_empty_name(store):
         store.register("   ", now=1.0)
 
 
+def test_register_stores_and_preserves_ccd_session_id(store):
+    p = store.register("lead", "coord", now=1.0, ccd_session_id="local_abc")
+    assert p.ccd_session_id == "local_abc"
+    # A bare refresh keeps the CCD id (like it keeps the role).
+    p2 = store.register("lead", now=2.0)
+    assert p2.ccd_session_id == "local_abc"
+    # participants() surfaces it on the dataclass but hides it from to_dict().
+    live = store.participants(now=2.0)[0]
+    assert live.ccd_session_id == "local_abc"
+    assert "ccd_session_id" not in live.to_dict()
+
+
+def test_migrate_adds_ccd_column_to_legacy_db(tmp_path):
+    # A DB created by an older schema (no ccd_session_id) must gain the column
+    # when reopened, without losing existing rows.
+    path = tmp_path / "legacy.db"
+    conn = sqlite3.connect(str(path))
+    conn.executescript(
+        "CREATE TABLE participants (name TEXT PRIMARY KEY, role TEXT NOT NULL DEFAULT '', "
+        "  last_seen REAL NOT NULL, registered_at REAL NOT NULL);"
+        "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, recipient TEXT, "
+        "  sender TEXT, body TEXT, reply_to INTEGER, created_at REAL);"
+        "INSERT INTO participants VALUES ('old', '', 1.0, 1.0);"
+    )
+    conn.commit()
+    conn.close()
+
+    s = Store(path)  # opening runs the migration
+    old = next(p for p in s.participants(now=1.0, ttl=1e9) if p.name == "old")
+    assert old.ccd_session_id == ""  # existing row defaults cleanly
+    s.register("old", now=2.0, ccd_session_id="local_xyz")  # and is now settable
+    assert next(p for p in s.participants(now=2.0, ttl=1e9)).ccd_session_id == "local_xyz"
+
+
 def test_register_strips_whitespace(store):
     p = store.register("  lead  ", "  boss  ", now=1.0)
     assert p.name == "lead"

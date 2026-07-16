@@ -64,7 +64,6 @@ async def test_lead_worker_round_trip(tmp_path):
         sent = data(await b.call_tool("send", {"to": "lead", "body": "what is 2+2?"}))
         qid = sent["id"]
         assert isinstance(qid, int)
-        assert sent["delivered_live"] is False  # stdio-style: no push
 
         got = data(await a.call_tool("inbox", {}))
         assert got["count"] == 1
@@ -108,8 +107,13 @@ async def test_participants_lists_both(tmp_path):
 
 
 async def test_participant_expires_after_ttl(tmp_path):
-    # Small TTL so the test stays fast but still exercises real elapsed time.
-    mcp = make_board(tmp_path, ttl=0.4)
+    # A short TTL keeps the test fast, but not so short that ordinary scheduling
+    # jitter on a loaded CI runner can exceed it: participants() heartbeats the
+    # caller and then queries liveness, and if the process is descheduled for
+    # longer than the TTL *between* those two steps, the just-touched caller is
+    # wrongly pruned. 1s comfortably clears that jitter while still expiring an
+    # idle peer within the ~1.5s sleep below.
+    mcp = make_board(tmp_path, ttl=1.0)
     async with sessions(mcp) as (ghost, watcher):
         data(await ghost.call_tool("register", {"name": "ghost"}))
         data(await watcher.call_tool("register", {"name": "watcher"}))
@@ -121,7 +125,7 @@ async def test_participant_expires_after_ttl(tmp_path):
 
         # ghost stops heartbeating; watcher keeps active. After the TTL passes,
         # ghost drops out while watcher (which just called a tool) remains.
-        await asyncio.sleep(0.6)
+        await asyncio.sleep(1.5)
         parts = data(await watcher.call_tool("participants", {}))
         names = {p["name"] for p in parts["participants"]}
         assert "ghost" not in names
@@ -245,6 +249,72 @@ async def test_send_without_registration_errors(tmp_path):
         assert res.isError
 
 
+# -- turn injection: channel capability + self-watch over the wire ----------
+
+
+async def test_channel_capability_advertised_and_push_is_harmless(tmp_path):
+    """Turn injection's wire-level invariants over a real MCP session:
+
+    * the server advertises the ``claude/channel`` capability in the initialize
+      handshake, which is what makes a real Claude Code client subscribe;
+    * the self-watch loop pushes a Channels notification to its own client, and a
+      *generic* MCP client (which, unlike Claude Code, never registered a handler
+      for the custom method) simply drops it -- so push is best-effort and never
+      breaks the session; the durable row is untouched and still drains.
+    """
+    mcp = build_server(Store(tmp_path / "switchboard.db"), ttl=300)
+    mcp._switchboard_relay._push_enabled = True  # run the self-watch loop
+    async with sessions(mcp) as (lead, worker):
+        # The capability the client sees on the wire (same field the SDK's own
+        # capability checks read); its presence is what a channel client keys on.
+        caps = lead._server_capabilities
+        assert caps is not None and (caps.experimental or {}).get("claude/channel") == {}
+
+        data(await lead.call_tool("register", {"name": "lead"}))
+        data(await worker.call_tool("register", {"name": "worker"}))
+        data(await worker.call_tool("send", {"to": "lead", "body": "ping"}))
+
+        # The watcher pushes a channel notification to lead's own client, which
+        # the generic SDK client drops; the session is unharmed and the durable
+        # message still drains.
+        await asyncio.sleep(0.2)  # let the notification propagate + be dropped
+        got = data(await lead.call_tool("inbox", {}))
+        assert [m["body"] for m in got["messages"]] == ["ping"]
+
+
+async def test_stdio_lifespan_starts_self_watch(tmp_path, monkeypatch):
+    """The FastMCP lifespan actually starts the self-watch loop under real run().
+
+    A stdio server with push enabled runs a background watcher (started by the
+    server lifespan) that polls the shared board and self-nudges its own client
+    -- turn injection with no daemon. We spy on ``_watch_tick`` to prove the loop
+    is wired up and running, without depending on the client understanding the
+    custom channel notification.
+    """
+    mcp = build_server(Store(tmp_path / "switchboard.db"), ttl=300)
+    sb = mcp._switchboard_relay
+    sb._push_enabled = True  # equivalent to launching with SWITCHBOARD_PUSH=1
+
+    ticks = 0
+    original = sb._watch_tick
+
+    async def spy(**kwargs):
+        nonlocal ticks
+        ticks += 1
+        return await original(**kwargs)
+
+    monkeypatch.setattr(sb, "_watch_tick", spy)
+
+    async with sessions(mcp) as (a, _b):
+        data(await a.call_tool("register", {"name": "lead"}))
+        for _ in range(250):  # up to ~5s for the lifespan-started loop to tick
+            if ticks:
+                break
+            await asyncio.sleep(0.02)
+
+    assert ticks >= 1  # the lifespan actually started and ran the watcher
+
+
 # -- durability across a "restart" ------------------------------------------
 
 
@@ -255,7 +325,7 @@ async def test_messages_persist_across_server_restart(tmp_path):
         data(await a.call_tool("register", {"name": "sender"}))
         data(await a.call_tool("send", {"to": "lead", "body": "still here after restart"}))
 
-    # Fresh server over the same DB file (simulating a daemon/CLI restart).
+    # Fresh server over the same DB file (simulating a process restart).
     mcp2 = make_board(tmp_path)
     async with sessions(mcp2) as (a, _b):
         data(await a.call_tool("register", {"name": "lead"}))

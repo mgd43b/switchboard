@@ -7,7 +7,6 @@ observed rather than actually started, plus the ``$SWITCHBOARD_TTL`` parsing.
 from __future__ import annotations
 
 import time
-import types
 
 import pytest
 
@@ -20,7 +19,6 @@ class FakeMCP:
     """Records how main() runs it instead of starting a real server."""
 
     def __init__(self):
-        self.settings = types.SimpleNamespace(host=None, port=None, streamable_http_path="/mcp")
         self.ran_transport = "UNSET"
 
     def run(self, transport="stdio"):
@@ -58,15 +56,6 @@ def test_main_defaults_to_stdio(fake_build):
     fake, _ = fake_build
     assert main([]) == 0
     assert fake.ran_transport == "stdio"
-
-
-def test_main_serve_uses_streamable_http(fake_build):
-    fake, _ = fake_build
-    rc = main(["serve", "--host", "9.9.9.9", "--port", "1234"])
-    assert rc == 0
-    assert fake.ran_transport == "streamable-http"
-    assert fake.settings.host == "9.9.9.9"
-    assert fake.settings.port == 1234
 
 
 def test_main_passes_db_and_ttl(fake_build, tmp_path):
