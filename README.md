@@ -188,6 +188,9 @@ Then restart Claude Desktop. Notes:
   swap in `"command": "uvx", "args": ["switchboard-relay"]` to skip installing.
 - Claude Desktop isn't project‑scoped, so pin an explicit `SWITCHBOARD_BOARD` (see
   [Boards](#boards-one-switchboard-per-project)) to keep its sessions on a predictable board.
+- Claude Desktop gets the durable tools (`register`/`send`/`inbox`/`wait`) but **not**
+  [turn injection](#turn-injection-push) — that's a Claude Code launch‑flag feature, so a Desktop
+  session polls rather than auto‑reacting.
 
 ### Run the tools without a confirmation prompt (optional)
 
@@ -413,6 +416,13 @@ By default a recipient only learns about a message when *it* next polls (`inbox(
 spot** — the message arrives *as a turn*, and the session drains its inbox and acts, with no manual
 poll. It rides Claude Code's [Channels](https://code.claude.com/docs/en/channels) capability (a
 research preview) — the "responsive‑lead" setup, a lead that answers the instant a worker asks.
+
+> **Claude Code (CLI) only.** You subscribe a session to a channel with a `claude` **launch flag**
+> (`--dangerously-load-development-channels`, below). **Claude Desktop and the IDE extensions have no
+> such flag, so they can't receive injected turns** — Channels is a Claude Code feature. They still
+> use switchboard's durable tools (`register`/`send`/`inbox`/`wait`) and just **poll**: a Desktop
+> session and a Claude Code session on the same board exchange messages fine, only the Desktop side
+> won't auto‑react. So the *reactor* must be Claude Code; the *sender* can be anything.
 
 ### The three hard constraints (be honest about these)
 
